@@ -644,6 +644,10 @@ class PageBuilder:
         self.rng = rng
         self.book_title_text: str | None = None
         self.chapter_title_text: str | None = None
+        # The running head is only shown once, on the first continuation page
+        # right after a heading (like a printed book's chapter-opener spread) --
+        # not repeated on every subsequent page of a long chapter.
+        self.header_shown_for_section = True  # nothing to show until a heading is placed
 
     def render_pages(self, blocks: list[Block], num_pages: int):
         queue = list(blocks)
@@ -651,12 +655,12 @@ class PageBuilder:
         page_idx = 0
         while page_idx < num_pages and queue:
             style = sample_page_style(self.profile, self.dpi, self.font_pool, self.rng)
-            image, boxes = self._render_one_page(queue, style, page_idx)
+            image, boxes = self._render_one_page(queue, style)
             pages.append((image, boxes, style))
             page_idx += 1
         return pages
 
-    def _render_one_page(self, queue: list[Block], style: PageStyle, page_idx: int):
+    def _render_one_page(self, queue: list[Block], style: PageStyle):
         canvas = Image.new("RGB", (style.width_px, style.height_px), style.background)
         draw = ImageDraw.Draw(canvas)
         boxes = []
@@ -666,7 +670,12 @@ class PageBuilder:
         top = style.margins_px["top"]
         bottom = style.height_px - style.margins_px["bottom"]
 
-        self._draw_header(draw, style, page_idx, left, right, top, boxes)
+        # Real books suppress the running head on a page that opens a new
+        # section/chapter -- the heading itself (rendered below) already
+        # identifies the page, so printing it twice would be redundant.
+        opens_new_document = bool(queue and queue[0].new_document)
+        if not opens_new_document:
+            self._draw_header(draw, style, left, right, top, boxes)
 
         cur_y = top
         page_has_content = False  # True once anything has been placed on this page
@@ -698,6 +707,7 @@ class PageBuilder:
                 cur_y += advanced + cstyle.line_height_px * GAP_AFTER_FRACTION.get(block.label, 0.0)
                 page_has_content = True
                 self.chapter_title_text = plain_text(block.line_words[-1])
+                self.header_shown_for_section = False  # show it once, on the next continuation page
                 if block.label == CLASS_DOC_TITLE and self.book_title_text is None:
                     self.book_title_text = plain_text(block.line_words[-1])
                 queue.pop(0)
@@ -718,12 +728,17 @@ class PageBuilder:
 
     # -- per-block placement helpers -------------------------------------
 
-    def _draw_header(self, draw, style: PageStyle, page_idx: int, left, right, top, boxes):
+    def _draw_header(self, draw, style: PageStyle, left, right, top, boxes):
         cstyle = style.class_styles.get(CLASS_HEADER)
-        text_source = self.book_title_text if page_idx % 2 == 0 else self.chapter_title_text
-        text_source = text_source or self.chapter_title_text or self.book_title_text
-        if cstyle is None or not text_source:
+        # The most specific heading seen so far (current chapter/section
+        # title), falling back to the book title only before any heading has
+        # been placed yet. No recto/verso alternation -- that flip-flopped
+        # between book and chapter title from page to page within one chapter,
+        # independently of which chapter was actually still open.
+        text_source = self.chapter_title_text or self.book_title_text
+        if cstyle is None or not text_source or self.header_shown_for_section:
             return
+        self.header_shown_for_section = True  # shown once; stays off for the rest of this section
         font_for = font_resolver(cstyle)
         band_top = max(0, top - cstyle.line_height_px * 1.6)
         y = band_top + (top - band_top - cstyle.font_size_px) / 2
