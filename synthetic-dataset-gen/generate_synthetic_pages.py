@@ -86,6 +86,14 @@ GAP_AFTER_FRACTION = {
     CLASS_CONTENT: 0.3, CLASS_REFERENCE_CONTENT: 0.3,
     CLASS_FOOTNOTE: 0.15, CLASS_IMAGE: 0.3, CLASS_FIGURE_TITLE: 0.3,
 }
+# For these two, extract_book_style.py mines the *actual* gap (PDF points)
+# from a heading to the nearest thing it introduces (see heading_spacing_pt
+# in the style profile), which is used in place of GAP_AFTER_FRACTION above
+# whenever the profile has it -- see sample_page_style / HEADING_SPACING_KEYS.
+HEADING_SPACING_KEYS = {
+    CLASS_PARAGRAPH_TITLE: "paragraph_title_to_text",
+    CLASS_DOC_TITLE: "doc_title_to_paragraph_title",
+}
 
 INLINE_BOLD_TAGS = {"b", "strong"}
 INLINE_ITALIC_TAGS = {"i", "em", "dfn"}
@@ -580,6 +588,21 @@ def ltr_alignment_dist(dist: dict | None) -> dict | None:
     return filtered or None
 
 
+# Real books rarely centre body text (the mined per-class distributions
+# reflect that -- "center" usually has only a percent or two of weight, if
+# any), but every class should still get a real, regularly-occurring chance
+# at a centered look for dataset diversity. So this is a separate per-class,
+# per-page coin flip layered in front of the mined left/justified/ragged
+# distribution, not just relying on "center"'s own (tiny) mined frequency.
+CENTER_ALIGNMENT_PROBABILITY = 0.5
+
+
+def sample_alignment(dist: dict | None, rng: random.Random) -> str:
+    if rng.random() < CENTER_ALIGNMENT_PROBABILITY:
+        return "center"
+    return sample_categorical(ltr_alignment_dist(dist), fallback="left", rng=rng)
+
+
 def jitter_color(rgb, amount: int, rng: random.Random):
     if not rgb:
         rgb = [30, 30, 30]
@@ -608,6 +631,9 @@ class PageStyle:
     class_styles: dict  # label -> ClassStyle
     heading_font: str
     body_font: str
+    heading_gap_px: dict  # label (doc_title/paragraph_title) -> mined "space after" in px, if the profile has it
+    page_number_position: str  # "top" | "bottom"
+    page_number_align: str  # "left" | "center" | "right"
 
 
 def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Random) -> PageStyle:
@@ -631,7 +657,7 @@ def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Ra
 
         font_size_pt = sample_numeric(text_style.get("font_size_pt"), fallback=10.0, rng=rng)
         line_spacing_pt = sample_numeric(text_style.get("line_spacing_pt"), fallback=font_size_pt * 1.35, rng=rng)
-        alignment = sample_categorical(ltr_alignment_dist(text_style.get("alignment")), fallback="left", rng=rng)
+        alignment = sample_alignment(text_style.get("alignment"), rng)
         ink_color = jitter_color(visual_style.get("ink_color_rgb"), amount=10, rng=rng)
 
         family = heading_font if label in HEADING_CLASSES else body_font
@@ -660,6 +686,13 @@ def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Ra
                 ink_color=base.ink_color,
             )
 
+    heading_spacing = profile.get("heading_spacing_pt") or {}
+    heading_gap_px = {}
+    for label, spacing_key in HEADING_SPACING_KEYS.items():
+        stat = heading_spacing.get(spacing_key)
+        if stat:  # None, or absent for books mined before this field existed
+            heading_gap_px[label] = pt_to_px(sample_numeric(stat, fallback=stat["mean"], rng=rng), dpi)
+
     return PageStyle(
         width_px=round(page_w_in * dpi),
         height_px=round(page_h_in * dpi),
@@ -668,6 +701,9 @@ def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Ra
         class_styles=class_styles,
         heading_font=heading_font,
         body_font=body_font,
+        heading_gap_px=heading_gap_px,
+        page_number_position=rng.choice(["top", "bottom"]),
+        page_number_align=rng.choice(["left", "center", "right"]),
     )
 
 
@@ -677,6 +713,15 @@ def font_resolver(cstyle: ClassStyle):
         path = cstyle.font_variants.get(key, cstyle.font_variants["regular"])
         return get_font(path, cstyle.font_size_px)
     return _font_for
+
+
+def gap_after_px(style: PageStyle, cstyle: ClassStyle, label: str) -> float:
+    """Vertical space to leave after a fully-placed block, before whatever
+    comes next. Uses extract_book_style.py's mined heading_spacing_pt for
+    doc_title/paragraph_title when the profile has it (see sample_page_style);
+    otherwise falls back to the fixed fraction-of-line-height heuristic."""
+    mined = style.heading_gap_px.get(label)
+    return mined if mined is not None else cstyle.line_height_px * GAP_AFTER_FRACTION.get(label, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -841,8 +886,9 @@ class PageBuilder:
         # section/chapter -- the heading itself (rendered below) already
         # identifies the page, so printing it twice would be redundant.
         opens_new_document = bool(queue and queue[0].new_document)
+        header_drawn = False
         if not opens_new_document:
-            self._draw_header(draw, style, left, right, top, boxes)
+            header_drawn = self._draw_header(draw, style, left, right, top, boxes)
 
         cur_y = top
         page_has_content = False  # True once anything has been placed on this page
@@ -862,7 +908,7 @@ class PageBuilder:
                 advanced = self._place_image(canvas, block, cstyle, left, right, cur_y, remaining, boxes, force)
                 if advanced is None:
                     break  # doesn't fit; leave it for a fresh page
-                cur_y += advanced + cstyle.line_height_px * GAP_AFTER_FRACTION.get(block.label, 0.0)
+                cur_y += advanced + gap_after_px(style, cstyle, block.label)
                 page_has_content = True
                 queue.pop(0)
                 continue
@@ -871,7 +917,7 @@ class PageBuilder:
                 advanced = self._place_heading(draw, block, cstyle, style, left, right, cur_y, remaining, boxes, force)
                 if advanced is None:
                     break
-                cur_y += advanced + cstyle.line_height_px * GAP_AFTER_FRACTION.get(block.label, 0.0)
+                cur_y += advanced + gap_after_px(style, cstyle, block.label)
                 page_has_content = True
                 self.chapter_title_text = plain_text(block.line_words[-1])
                 self.header_shown_for_section = False  # show it once, on the next continuation page
@@ -888,18 +934,18 @@ class PageBuilder:
             cur_y += advanced
             page_has_content = True
             if fully_consumed:
-                cur_y += cstyle.line_height_px * GAP_AFTER_FRACTION.get(block.label, 0.0)
+                cur_y += gap_after_px(style, cstyle, block.label)
                 queue.pop(0)
 
         has_title = any(b["label"] in (CLASS_DOC_TITLE, CLASS_PARAGRAPH_TITLE) for b in boxes)
         if not has_title:
-            self._draw_page_number(draw, style, page_number, left, right, bottom, boxes)
+            self._draw_page_number(draw, style, page_number, left, right, top, bottom, header_drawn, boxes)
 
         return canvas, boxes
 
     # -- per-block placement helpers -------------------------------------
 
-    def _draw_header(self, draw, style: PageStyle, left, right, top, boxes):
+    def _draw_header(self, draw, style: PageStyle, left, right, top, boxes) -> bool:
         cstyle = style.class_styles.get(CLASS_HEADER)
         # The most specific heading seen so far (current chapter/section
         # title), falling back to the book title only before any heading has
@@ -908,7 +954,7 @@ class PageBuilder:
         # independently of which chapter was actually still open.
         text_source = self.chapter_title_text or self.book_title_text
         if cstyle is None or not text_source or self.header_shown_for_section:
-            return
+            return False
         self.header_shown_for_section = True  # shown once; stays off for the rest of this section
         font_for = font_resolver(cstyle)
         band_top = max(0, top - cstyle.line_height_px * 1.6)
@@ -920,8 +966,10 @@ class PageBuilder:
         if line:
             _, _, w = line_metrics(line, font_for)
             boxes.append(_box(CLASS_HEADER, left, y, left + w, y + cstyle.font_size_px))
+        return True
 
-    def _draw_page_number(self, draw, style: PageStyle, page_number: int, left, right, bottom, boxes):
+    def _draw_page_number(self, draw, style: PageStyle, page_number: int, left, right, top, bottom,
+                           header_drawn: bool, boxes):
         # "number" isn't one of the mined profile's classes, so there's no
         # sampled style for it -- reuse the body text's font/size/colour
         # (scaled down a bit) rather than inventing an unrelated look.
@@ -932,9 +980,29 @@ class PageBuilder:
         font = get_font(base.font_variants["regular"], size_px)
         text = str(page_number)
         w = font.getlength(text)
-        band_bottom = min(style.height_px, bottom + base.line_height_px * 1.6)
-        y = bottom + (band_bottom - bottom - size_px) / 2
-        x = left + max(0.0, ((right - left) - w) / 2)
+
+        if style.page_number_position == "top":
+            band_bottom = top
+            if header_drawn:
+                # The running head already occupies the band just above `top`
+                # -- stack the number in a further band so they don't overlap.
+                header_cstyle = style.class_styles.get(CLASS_HEADER)
+                header_band_h = header_cstyle.line_height_px * 1.6 if header_cstyle else size_px * 1.6
+                band_bottom = max(0, top - header_band_h)
+            band_top = max(0, band_bottom - size_px * 1.6)
+            y = band_top + (band_bottom - band_top - size_px) / 2
+        else:  # "bottom"
+            band_top = bottom
+            band_bottom = min(style.height_px, bottom + base.line_height_px * 1.6)
+            y = band_top + (band_bottom - band_top - size_px) / 2
+
+        if style.page_number_align == "left":
+            x = left
+        elif style.page_number_align == "right":
+            x = right - w
+        else:
+            x = left + max(0.0, ((right - left) - w) / 2)
+
         draw.text((x, y), text, font=font, fill=base.ink_color)
         boxes.append(_box(CLASS_NUMBER, x, y, x + w, y + size_px))
 
