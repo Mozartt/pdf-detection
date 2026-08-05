@@ -258,6 +258,42 @@ def line_spacing_pt(lines: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Heading -> body spacing (paragraph_title -> its paragraph, doc_title -> its
+# paragraph_title), used downstream to place synthetic headings with a
+# realistic gap instead of a guessed fraction of the line height.
+# ---------------------------------------------------------------------------
+
+def horizontal_overlap_frac(box_a_pt, box_b_pt) -> float:
+    """Fraction of the narrower box's width that the two boxes overlap
+    horizontally -- used to avoid pairing a heading with an unrelated
+    column's text that just happens to sit below it vertically."""
+    ax0, _, ax1, _ = box_a_pt
+    bx0, _, bx1, _ = box_b_pt
+    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    narrower = min(ax1 - ax0, bx1 - bx0)
+    return inter / narrower if narrower > 0 else 0.0
+
+
+def nearest_gap_below_pt(from_box_pt, candidates_pt, min_overlap_frac: float = 0.3):
+    """Smallest vertical gap (PDF points) from the bottom of `from_box_pt` to
+    the top of the nearest box in `candidates_pt` that sits below it and
+    overlaps it horizontally by at least `min_overlap_frac`. None if no such
+    candidate exists on the page (e.g. the heading is the last thing on it)."""
+    _, _, _, y1 = from_box_pt
+    best = None
+    for cand in candidates_pt:
+        cy0 = cand[1]
+        gap = cy0 - y1
+        if gap < 0:
+            continue
+        if horizontal_overlap_frac(from_box_pt, cand) < min_overlap_frac:
+            continue
+        if best is None or gap < best:
+            best = gap
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Per-box feature extraction
 # ---------------------------------------------------------------------------
 
@@ -430,6 +466,8 @@ def main():
     all_margins_pt = []
     body_margins_pt = []
     font_name_samples = []
+    paragraph_title_to_text_gaps_pt = []
+    doc_title_to_paragraph_title_gaps_pt = []
 
     for i, page_index in enumerate(page_indices):
         if page_index >= len(doc):
@@ -455,6 +493,18 @@ def main():
         body_boxes_pt = [bp for b, bp in zip(boxes, boxes_pt) if b["label"] not in NON_BODY_LABELS]
         if body_boxes_pt:
             body_margins_pt.append(compute_page_margins_pt(body_boxes_pt, page.rect.width, page.rect.height))
+
+        boxes_pt_by_label = defaultdict(list)
+        for b, bp in zip(boxes, boxes_pt):
+            boxes_pt_by_label[b["label"]].append(bp)
+        for title_pt in boxes_pt_by_label.get("paragraph_title", []):
+            gap = nearest_gap_below_pt(title_pt, boxes_pt_by_label.get("text", []))
+            if gap is not None:
+                paragraph_title_to_text_gaps_pt.append(gap)
+        for doc_title_pt in boxes_pt_by_label.get("doc_title", []):
+            gap = nearest_gap_below_pt(doc_title_pt, boxes_pt_by_label.get("paragraph_title", []))
+            if gap is not None:
+                doc_title_to_paragraph_title_gaps_pt.append(gap)
 
         for box in boxes:
             class_feats[box["label"]].append(extract_box_features(box, page_lines, page_rgb, pt_per_px))
@@ -482,6 +532,13 @@ def main():
         "content_margins_in": _margins_to_inches(_median_margins(all_margins_pt)),
         "body_text_margins_in": _margins_to_inches(_median_margins(body_margins_pt)),
         "classes": {label: build_class_profile(label, feats) for label, feats in sorted(class_feats.items())},
+        # Vertical gap (PDF points) from the bottom of a heading to the top of
+        # the nearest thing below it that it introduces -- i.e. the "space
+        # after" a heading, mined from real layout instead of guessed.
+        "heading_spacing_pt": {
+            "paragraph_title_to_text": summarize_numeric(paragraph_title_to_text_gaps_pt),
+            "doc_title_to_paragraph_title": summarize_numeric(doc_title_to_paragraph_title_gaps_pt),
+        },
     }
 
     out_path = Path(args.out)

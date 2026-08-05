@@ -26,6 +26,7 @@ Pipeline:
 Usage:
     python generate_synthetic_pages.py --num-pages 30
     python generate_synthetic_pages.py --epub data/epubs/some-book.epub --num-pages 50 --seed 7
+    python generate_synthetic_pages.py --num-pages 0   # process the whole book, however many pages that takes
 """
 
 import argparse
@@ -50,23 +51,31 @@ from PIL import Image, ImageDraw, ImageFont
 #   p[epub:type~="title"]            -> paragraph_title     (chapter subtitle line)
 #   <footer> (letter valediction/signature)  -> reference_content
 #   <li> inside an endnotes/footnotes list   -> footnote
-#   <blockquote> ... <p>             -> content             (quotes, verse, letters)
-#   <img>                            -> image
+#   <blockquote> ... <p>             -> text, indented      (quotes, verse, letters)
+#   <figure><img/><figcaption>       -> image + figure_title (caption associated with the image)
+#   <img> (standalone)               -> image
+#   nav[epub:type="toc"] entries     -> content              (table of contents -- see parse_toc_blocks)
 #   everything else <p>              -> text
-#   (synthesized, not read from the EPUB) running head at top of page -> header
+#   (synthesized, not read from the EPUB) running head, shown once right after each heading -> header
+#   (synthesized, not read from the EPUB) folio on any page that has no title on it -> number
 CLASS_DOC_TITLE = "doc_title"
 CLASS_PARAGRAPH_TITLE = "paragraph_title"
 CLASS_REFERENCE_CONTENT = "reference_content"
 CLASS_FOOTNOTE = "footnote"
-CLASS_CONTENT = "content"
+CLASS_CONTENT = "content"  # table-of-contents region, not quotes/letters
 CLASS_IMAGE = "image"
 CLASS_TEXT = "text"
 CLASS_HEADER = "header"
+CLASS_FIGURE_TITLE = "figure_title"  # figure/image caption
+CLASS_NUMBER = "number"  # synthesized page folio
 
 HEADING_CLASSES = {CLASS_DOC_TITLE, CLASS_PARAGRAPH_TITLE, CLASS_HEADER}
-# Classes rendered as an indented block (quotes/verse/letters), inset from
-# the full text column on both sides.
-INSET_FRACTION = {CLASS_CONTENT: 0.07, CLASS_REFERENCE_CONTENT: 0.05}
+# Classes rendered as an indented block, inset from the full text column on
+# both sides. Blockquote-originating text (quotes/verse/letters) also gets
+# this treatment via the per-Block `inset` flag rather than its class label,
+# since it's labelled "text" like any other paragraph -- see block_inset_fraction.
+INSET_FRACTION = {CLASS_REFERENCE_CONTENT: 0.05, CLASS_FIGURE_TITLE: 0.1}
+BLOCKQUOTE_INSET_FRACTION = 0.07
 # First-line paragraph indent applies only to ordinary body text.
 INDENT_CLASSES = {CLASS_TEXT}
 # Extra vertical breathing room (as a fraction of the class's line height)
@@ -75,7 +84,7 @@ INDENT_CLASSES = {CLASS_TEXT}
 GAP_AFTER_FRACTION = {
     CLASS_DOC_TITLE: 0.6, CLASS_PARAGRAPH_TITLE: 0.6,
     CLASS_CONTENT: 0.3, CLASS_REFERENCE_CONTENT: 0.3,
-    CLASS_FOOTNOTE: 0.15, CLASS_IMAGE: 0.3,
+    CLASS_FOOTNOTE: 0.15, CLASS_IMAGE: 0.3, CLASS_FIGURE_TITLE: 0.3,
 }
 
 INLINE_BOLD_TAGS = {"b", "strong"}
@@ -106,6 +115,7 @@ class Block:
     image_bytes: bytes = None                        # kind == "image"
     used_indent: bool = False                         # first line already consumed?
     new_document: bool = False                        # first block of a spine document -> force a fresh page
+    inset: bool = False                               # rendered as an indented block (e.g. from a <blockquote>)
 
 
 def local_tag(el) -> str | None:
@@ -242,13 +252,11 @@ def walk_blocks(el, ctx: dict, blocks: list[Block]) -> None:
                 label = CLASS_PARAGRAPH_TITLE
             elif ctx.get("in_endnote"):
                 label = CLASS_FOOTNOTE
-            elif ctx.get("in_blockquote"):
-                label = CLASS_CONTENT
             else:
-                label = CLASS_TEXT
+                label = CLASS_TEXT  # includes blockquote paragraphs (quotes/verse/letters) -- see `inset` below
             words = extract_words(child)
             if words:
-                blocks.append(Block(label=label, kind="paragraph", words=words))
+                blocks.append(Block(label=label, kind="paragraph", words=words, inset=ctx.get("in_blockquote", False)))
             continue
 
         if tag == "footer":
@@ -260,6 +268,19 @@ def walk_blocks(el, ctx: dict, blocks: list[Block]) -> None:
         if tag == "blockquote":
             sub_ctx = {**ctx, "in_blockquote": True, "in_endnote": False}
             walk_blocks(child, sub_ctx, blocks)
+            continue
+
+        if tag == "figure":
+            img_el = next((c for c in child if local_tag(c) == "img"), None)
+            if img_el is not None:
+                src = img_el.get("src")
+                if src:
+                    blocks.append(Block(label=CLASS_IMAGE, kind="image", image_bytes=None, words=[src]))
+            cap_el = next((c for c in child if local_tag(c) == "figcaption"), None)
+            if cap_el is not None:
+                words = extract_words(cap_el)
+                if words:
+                    blocks.append(Block(label=CLASS_FIGURE_TITLE, kind="paragraph", words=words))
             continue
 
         if tag == "img":
@@ -295,12 +316,17 @@ def walk_blocks(el, ctx: dict, blocks: list[Block]) -> None:
         walk_blocks(child, ctx, blocks)
 
 
-def spine_documents(zf: zipfile.ZipFile) -> list[str]:
-    """Return the epub-internal paths of every spine document, in reading order."""
+def load_opf(zf: zipfile.ZipFile):
+    """Return (opf_root, opf_dir) for the EPUB's package document."""
     container = etree.fromstring(zf.read("META-INF/container.xml"))
     opf_path = container.find(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile").get("full-path")
     opf_dir = opf_path.rsplit("/", 1)[0] if "/" in opf_path else ""
-    opf = etree.fromstring(zf.read(opf_path))
+    return etree.fromstring(zf.read(opf_path)), opf_dir
+
+
+def spine_documents(zf: zipfile.ZipFile) -> list[str]:
+    """Return the epub-internal paths of every spine document, in reading order."""
+    opf, opf_dir = load_opf(zf)
     ns = {"opf": "http://www.idpf.org/2007/opf"}
     manifest = {it.get("id"): it.get("href") for it in opf.findall(".//opf:manifest/opf:item", ns)}
     media_types = {it.get("id"): it.get("media-type") for it in opf.findall(".//opf:manifest/opf:item", ns)}
@@ -318,6 +344,20 @@ def spine_documents(zf: zipfile.ZipFile) -> list[str]:
     return paths
 
 
+def find_nav_path(zf: zipfile.ZipFile) -> str | None:
+    """Return the epub-internal path of the EPUB3 nav document (the manifest
+    item with properties="nav", e.g. <nav epub:type="toc">). Most reading
+    systems -- and this generator's own `spine_documents` -- exclude it from
+    the linear reading order, so it needs to be located separately."""
+    opf, opf_dir = load_opf(zf)
+    ns = {"opf": "http://www.idpf.org/2007/opf"}
+    for item in opf.findall(".//opf:manifest/opf:item", ns):
+        if "nav" in (item.get("properties") or "").split():
+            href = item.get("href")
+            return f"{opf_dir}/{href}" if opf_dir else href
+    return None
+
+
 def resolve_image_ref(xhtml_path: str, src: str) -> str:
     base_dir = xhtml_path.rsplit("/", 1)[0] if "/" in xhtml_path else ""
     parts = (base_dir + "/" + src).split("/") if base_dir else src.split("/")
@@ -333,10 +373,82 @@ def resolve_image_ref(xhtml_path: str, src: str) -> str:
     return "/".join(resolved)
 
 
-def parse_epub_blocks(epub_path: Path) -> list[Block]:
-    """Read every spine document and flatten it into an ordered block queue,
-    resolving <img> references to actual bytes."""
+def toc_link_text(a_el) -> str:
+    return " ".join(clean_text("".join(a_el.itertext())).split())
+
+
+def collect_toc_lines(ol_el, depth: int, lines: list[tuple[int, str]]) -> None:
+    """Flatten a (possibly nested) <ol> of ToC <li><a> entries into
+    (indent-depth, link-text) pairs, in document order."""
+    for li in ol_el:
+        if local_tag(li) != "li":
+            continue
+        a = next((c for c in li if local_tag(c) == "a"), None)
+        if a is not None:
+            text = toc_link_text(a)
+            if text:
+                lines.append((depth, text))
+        for sub in li:
+            if local_tag(sub) == "ol":
+                collect_toc_lines(sub, depth + 1, lines)
+
+
+def parse_toc_blocks(zf: zipfile.ZipFile) -> list[Block]:
+    """Parse the EPUB3 nav document into a heading + one "content" block --
+    PP-DocLayout's "content" class denotes a table-of-contents region, not
+    quotes/letters. Most reading systems exclude this document from the
+    linear spine, but a real printed book almost always has a Contents page."""
+    nav_path = find_nav_path(zf)
+    if not nav_path:
+        return []
+    try:
+        data = zf.read(nav_path)
+    except KeyError:
+        return []
+    root = etree.HTML(data)
+    if root is None:
+        return []
+    nav_el = next((n for n in root.iter("nav") if has_type(n, "toc")), None)
+    if nav_el is None:
+        nav_el = root.find(".//nav")
+    if nav_el is None:
+        return []
+
     blocks: list[Block] = []
+    heading_el = next((c for c in nav_el if re.fullmatch(r"h[1-6]", local_tag(c) or "")), None)
+    if heading_el is not None:
+        words = extract_words(heading_el)
+        if words:
+            blocks.append(Block(label=CLASS_PARAGRAPH_TITLE, kind="heading", line_words=[words]))
+
+    lines: list[tuple[int, str]] = []
+    for ol in nav_el:
+        if local_tag(ol) == "ol":
+            collect_toc_lines(ol, 0, lines)
+
+    toc_words: list[Word] = []
+    for depth, text in lines:
+        parts = text.split()
+        if not parts:
+            continue
+        toc_words.append(Word(("    " * depth) + parts[0]))
+        toc_words.extend(Word(p) for p in parts[1:])
+        toc_words.append(Word(BREAK_TEXT))
+    if toc_words and toc_words[-1].text == BREAK_TEXT:
+        toc_words.pop()
+    if toc_words:
+        blocks.append(Block(label=CLASS_CONTENT, kind="paragraph", words=toc_words))
+
+    if blocks:
+        blocks[0].new_document = True
+    return blocks
+
+
+def parse_epub_blocks(epub_path: Path) -> list[Block]:
+    """Read every spine document (plus the nav/ToC document, spliced in right
+    after the title page) and flatten them into an ordered block queue,
+    resolving <img> references to actual bytes."""
+    documents: list[list[Block]] = []
     with zipfile.ZipFile(epub_path) as zf:
         for doc_path in spine_documents(zf):
             try:
@@ -364,13 +476,26 @@ def parse_epub_blocks(epub_path: Path) -> list[Block]:
                     try:
                         b.image_bytes = zf.read(img_path)
                     except KeyError:
-                        continue  # unresolved image reference, skip block
-            blocks.extend(doc_blocks)
-    return blocks
+                        pass  # unresolved reference -- falls back to a placeholder at render time
+            documents.append(doc_blocks)
+
+        toc_blocks = parse_toc_blocks(zf)
+        if toc_blocks:
+            # The nav document isn't in the spine (see find_nav_path), so
+            # splice it in ourselves, right after the title page.
+            documents.insert(min(1, len(documents)), toc_blocks)
+
+    return [block for doc in documents for block in doc]
 
 
 def plain_text(words: list[Word]) -> str:
     return " ".join(w.text for w in words if w.text != BREAK_TEXT)
+
+
+def block_inset_fraction(block: Block) -> float:
+    if block.inset:
+        return BLOCKQUOTE_INSET_FRACTION
+    return INSET_FRACTION.get(block.label, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +567,19 @@ def sample_categorical(dist: dict | None, fallback: str, rng: random.Random) -> 
     return rng.choices(keys, weights=weights, k=1)[0]
 
 
+# This generator only handles left-to-right (English) books, so a flush-right
+# paragraph -- which reads like right-to-left body text -- is never sampled,
+# even though the mined profile records it as an observed alignment.
+NON_LTR_ALIGNMENTS = {"right"}
+
+
+def ltr_alignment_dist(dist: dict | None) -> dict | None:
+    if not dist:
+        return dist
+    filtered = {k: v for k, v in dist.items() if k not in NON_LTR_ALIGNMENTS}
+    return filtered or None
+
+
 def jitter_color(rgb, amount: int, rng: random.Random):
     if not rgb:
         rgb = [30, 30, 30]
@@ -493,7 +631,7 @@ def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Ra
 
         font_size_pt = sample_numeric(text_style.get("font_size_pt"), fallback=10.0, rng=rng)
         line_spacing_pt = sample_numeric(text_style.get("line_spacing_pt"), fallback=font_size_pt * 1.35, rng=rng)
-        alignment = sample_categorical(text_style.get("alignment"), fallback="left", rng=rng)
+        alignment = sample_categorical(ltr_alignment_dist(text_style.get("alignment")), fallback="left", rng=rng)
         ink_color = jitter_color(visual_style.get("ink_color_rgb"), amount=10, rng=rng)
 
         family = heading_font if label in HEADING_CLASSES else body_font
@@ -507,6 +645,20 @@ def sample_page_style(profile: dict, dpi: float, font_pool: dict, rng: random.Ra
             alignment=alignment,
             ink_color=ink_color,
         )
+
+    if CLASS_FIGURE_TITLE not in class_styles:
+        # Not one of the mined profile's classes -- borrow footnote's (or
+        # text's) sampled size/color as a reasonable stand-in for a caption,
+        # centered under its image.
+        base = class_styles.get(CLASS_FOOTNOTE) or class_styles.get(CLASS_TEXT)
+        if base is not None:
+            class_styles[CLASS_FIGURE_TITLE] = ClassStyle(
+                font_variants=base.font_variants,
+                font_size_px=base.font_size_px,
+                line_height_px=base.line_height_px,
+                alignment="center",
+                ink_color=base.ink_color,
+            )
 
     return PageStyle(
         width_px=round(page_w_in * dpi),
@@ -531,9 +683,18 @@ def font_resolver(cstyle: ClassStyle):
 # Word-wrap / justification
 # ---------------------------------------------------------------------------
 
-def wrap_words(words: list[Word], font_for, max_width_px: float, first_line_indent_px: float = 0) -> list[list[Word]]:
-    """Greedy word-wrap honouring explicit BREAK_TEXT markers (<br/>)."""
+def wrap_words(words: list[Word], font_for, max_width_px: float, first_line_indent_px: float = 0
+               ) -> tuple[list[list[Word]], list[bool]]:
+    """Greedy word-wrap honouring explicit BREAK_TEXT markers (<br/>).
+
+    Returns (lines, hard_break_after) -- hard_break_after[i] is True iff line
+    i ended because of an explicit BREAK_TEXT (a real line break, e.g. a ToC
+    entry or a letter's "<br/>"-separated closing lines) rather than natural
+    word-wrap overflow. Callers must not justify a hard-broken line -- unlike
+    a wrapped prose line, it isn't a fragment of a longer line that natural
+    wrapping cut short, so stretching it to the column width looks wrong."""
     lines: list[list[Word]] = []
+    hard_break_after: list[bool] = []
     current: list[Word] = []
     width = 0.0
     is_first_line = True
@@ -544,6 +705,7 @@ def wrap_words(words: list[Word], font_for, max_width_px: float, first_line_inde
     for w in words:
         if w.text == BREAK_TEXT:
             lines.append(current)
+            hard_break_after.append(True)
             current, width = [], 0.0
             is_first_line = False
             continue
@@ -552,6 +714,7 @@ def wrap_words(words: list[Word], font_for, max_width_px: float, first_line_inde
         extra = f.getlength(" ") if (current and w.space_before) else 0.0
         if current and width + extra + ww > line_limit():
             lines.append(current)
+            hard_break_after.append(False)
             current, width = [], 0.0
             is_first_line = False
             extra = 0.0
@@ -559,7 +722,8 @@ def wrap_words(words: list[Word], font_for, max_width_px: float, first_line_inde
         current.append(w)
     if current:
         lines.append(current)
-    return lines
+        hard_break_after.append(False)
+    return lines, hard_break_after
 
 
 def line_metrics(words: list[Word], font_for):
@@ -605,6 +769,7 @@ def draw_line(draw: ImageDraw.ImageDraw, words: list[Word], font_for, x0: float,
 LAYOUT_CLASSES = [
     CLASS_CONTENT, CLASS_DOC_TITLE, CLASS_FOOTNOTE, CLASS_HEADER,
     CLASS_IMAGE, CLASS_PARAGRAPH_TITLE, CLASS_REFERENCE_CONTENT, CLASS_TEXT,
+    CLASS_FIGURE_TITLE, CLASS_NUMBER,
 ]
 CLASS_IDS = {label: i for i, label in enumerate(LAYOUT_CLASSES)}
 
@@ -649,18 +814,20 @@ class PageBuilder:
         # not repeated on every subsequent page of a long chapter.
         self.header_shown_for_section = True  # nothing to show until a heading is placed
 
-    def render_pages(self, blocks: list[Block], num_pages: int):
+    def render_pages(self, blocks: list[Block], num_pages: int | None):
+        """num_pages=None renders until the block queue is fully consumed
+        (i.e. the whole book), rather than stopping at a fixed page count."""
         queue = list(blocks)
         pages = []
         page_idx = 0
-        while page_idx < num_pages and queue:
+        while queue and (num_pages is None or page_idx < num_pages):
             style = sample_page_style(self.profile, self.dpi, self.font_pool, self.rng)
-            image, boxes = self._render_one_page(queue, style)
+            image, boxes = self._render_one_page(queue, style, page_idx + 1)
             pages.append((image, boxes, style))
             page_idx += 1
         return pages
 
-    def _render_one_page(self, queue: list[Block], style: PageStyle):
+    def _render_one_page(self, queue: list[Block], style: PageStyle, page_number: int):
         canvas = Image.new("RGB", (style.width_px, style.height_px), style.background)
         draw = ImageDraw.Draw(canvas)
         boxes = []
@@ -724,6 +891,10 @@ class PageBuilder:
                 cur_y += cstyle.line_height_px * GAP_AFTER_FRACTION.get(block.label, 0.0)
                 queue.pop(0)
 
+        has_title = any(b["label"] in (CLASS_DOC_TITLE, CLASS_PARAGRAPH_TITLE) for b in boxes)
+        if not has_title:
+            self._draw_page_number(draw, style, page_number, left, right, bottom, boxes)
+
         return canvas, boxes
 
     # -- per-block placement helpers -------------------------------------
@@ -743,12 +914,29 @@ class PageBuilder:
         band_top = max(0, top - cstyle.line_height_px * 1.6)
         y = band_top + (top - band_top - cstyle.font_size_px) / 2
         words = [Word(w) for w in text_source.split()]
-        wrapped = wrap_words(words, font_for, right - left)
+        wrapped, _ = wrap_words(words, font_for, right - left)
         line = wrapped[0] if wrapped else []
         draw_line(draw, line, font_for, left, right, y, cstyle.alignment, cstyle.ink_color, justify=False)
         if line:
             _, _, w = line_metrics(line, font_for)
             boxes.append(_box(CLASS_HEADER, left, y, left + w, y + cstyle.font_size_px))
+
+    def _draw_page_number(self, draw, style: PageStyle, page_number: int, left, right, bottom, boxes):
+        # "number" isn't one of the mined profile's classes, so there's no
+        # sampled style for it -- reuse the body text's font/size/colour
+        # (scaled down a bit) rather than inventing an unrelated look.
+        base = style.class_styles.get(CLASS_TEXT) or next(iter(style.class_styles.values()), None)
+        if base is None:
+            return
+        size_px = max(8, round(base.font_size_px * 0.85))
+        font = get_font(base.font_variants["regular"], size_px)
+        text = str(page_number)
+        w = font.getlength(text)
+        band_bottom = min(style.height_px, bottom + base.line_height_px * 1.6)
+        y = bottom + (band_bottom - bottom - size_px) / 2
+        x = left + max(0.0, ((right - left) - w) / 2)
+        draw.text((x, y), text, font=font, fill=base.ink_color)
+        boxes.append(_box(CLASS_NUMBER, x, y, x + w, y + size_px))
 
     def _place_image(self, canvas: Image.Image, block: Block, cstyle: ClassStyle, left, right, cur_y, remaining,
                       boxes, force: bool = False):
@@ -778,13 +966,14 @@ class PageBuilder:
 
     def _place_heading(self, draw, block: Block, cstyle: ClassStyle, style: PageStyle, left, right, cur_y, remaining,
                         boxes, force: bool = False):
-        inset = round((right - left) * INSET_FRACTION.get(block.label, 0.0))
+        inset = round((right - left) * block_inset_fraction(block))
         x0, x1 = left + inset, right - inset
         font_for = font_resolver(cstyle)
 
         all_lines = []
         for line_words in block.line_words:
-            all_lines.extend(wrap_words(line_words, font_for, x1 - x0))
+            wrapped_lines, _ = wrap_words(line_words, font_for, x1 - x0)
+            all_lines.extend(wrapped_lines)
         height = len(all_lines) * cstyle.line_height_px
 
         if not force:
@@ -814,14 +1003,14 @@ class PageBuilder:
 
     def _place_paragraph(self, draw, block: Block, cstyle: ClassStyle, left, right, cur_y, remaining, boxes,
                           force: bool = False):
-        inset = round((right - left) * INSET_FRACTION.get(block.label, 0.0))
+        inset = round((right - left) * block_inset_fraction(block))
         x0, x1 = left + inset, right - inset
         font_for = font_resolver(cstyle)
         indent_px = 2.2 * font_for(False, False).getlength(" ") if (
             block.label in INDENT_CLASSES and not block.used_indent
         ) else 0.0
 
-        lines = wrap_words(block.words, font_for, x1 - x0, first_line_indent_px=indent_px)
+        lines, hard_break_after = wrap_words(block.words, font_for, x1 - x0, first_line_indent_px=indent_px)
         max_lines = int(remaining // cstyle.line_height_px)
         if max_lines <= 0:
             if not force:
@@ -832,7 +1021,7 @@ class PageBuilder:
         y = cur_y
         for i, line in enumerate(fit_lines):
             is_last_overall = (i == len(lines) - 1)
-            justify = cstyle.alignment == "justified" and not is_last_overall
+            justify = cstyle.alignment == "justified" and not is_last_overall and not hard_break_after[i]
             lx0 = x0 + (indent_px if i == 0 else 0)
             draw_line(draw, line, font_for, lx0, x1, y, cstyle.alignment, cstyle.ink_color, justify=justify)
             y += cstyle.line_height_px
@@ -882,7 +1071,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--epub", type=Path, default=None, help="Source EPUB (default: auto-discover under data/epub(s)/)")
     parser.add_argument("--style-profile", type=Path, default=Path("outputs/book_style_profile_full.json"))
-    parser.add_argument("--num-pages", type=int, default=30, help="How many page images to generate")
+    parser.add_argument("--num-pages", type=int, default=30,
+                         help="How many page images to generate. Pass 0 to process the entire book "
+                              "(render until the EPUB's content is exhausted).")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/synthetic-dataset"))
     parser.add_argument("--dpi", type=float, default=None, help="Default: the profile's own render_dpi")
     parser.add_argument("--fonts-dir", type=Path, default=Path(os.environ.get("SystemRoot", "C:/Windows")) / "Fonts")
@@ -904,8 +1095,10 @@ def main():
     images_dir.mkdir(parents=True, exist_ok=True)
     ann_dir.mkdir(parents=True, exist_ok=True)
 
+    num_pages = None if args.num_pages == 0 else args.num_pages
+
     builder = PageBuilder(profile, font_pool, dpi, rng)
-    pages = builder.render_pages(blocks, args.num_pages)
+    pages = builder.render_pages(blocks, num_pages)
 
     manifest = []
     for i, (image, boxes, style) in enumerate(pages, start=1):
@@ -941,8 +1134,8 @@ def main():
     print(f"  - Images:      {images_dir}")
     print(f"  - Annotations: {ann_dir}")
     print(f"  - Manifest:    {args.out_dir / 'manifest.json'}")
-    if len(pages) < args.num_pages:
-        print(f"Note: the EPUB ran out of content after {len(pages)} page(s) (requested {args.num_pages}).")
+    if num_pages is not None and len(pages) < num_pages:
+        print(f"Note: the EPUB ran out of content after {len(pages)} page(s) (requested {num_pages}).")
 
 
 if __name__ == "__main__":
